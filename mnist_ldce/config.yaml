@@ -1,0 +1,109 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# LDCE run configuration for MNIST
+#
+# Run from the REPOSITORY ROOT with:
+#   python -m mnist_ldce.run
+# ──────────────────────────────────────────────────────────────────────────────
+
+resume: false                   # set true to continue an interrupted run
+record_intermediate_results: false
+output_dir: ./results/mnist_ldce
+
+
+# ── Model paths ───────────────────────────────────────────────────────────────
+
+diffusion_model:
+  # Architecture config – keep in sync with the checkpoint below
+  cfg_path:  "mnist_ldce/ddpm_mnist.yaml"
+  # ↓ UPDATE: path to your pretrained MNIST DDPM checkpoint (.ckpt / .pt)
+  ckpt_path: "/path/to/your/mnist_ddpm.ckpt"
+
+classifier_model:
+  # ↓ UPDATE: path to your pretrained MNIST digit classifier (.pth / .pt)
+  ckpt_path: "/path/to/your/mnist_classifier.pth"
+
+  # true  → your classifier accepts raw [0, 1] images and handles its own
+  #          normalization internally (most common case for MNIST CNNs).
+  # false → the LDCE sampler will apply centre-crop + ImageNet normalisation
+  #          before calling the classifier (only useful for ImageNet models).
+  classifier_wrapper: true
+
+  # If your classifier was trained with MNIST-specific normalisation
+  # (mean=0.1307, std=0.3081 per channel), set this to true so run.py wraps it
+  # in a Normalizer before passing images.
+  mnist_normalisation: false
+
+
+# ── Generation settings ───────────────────────────────────────────────────────
+
+n_samples_per_class: 1
+
+# Fraction of the diffusion schedule used for the forward (noising) pass.
+# Larger → more freedom to change appearance; smaller → stays closer to input.
+# Good starting range for MNIST: 0.3 – 0.6
+strength: 0.5
+
+# Classifier-free guidance scale (w in the paper).
+# Higher values push harder toward the target class but may reduce image quality.
+scale: 1.0
+
+# Total denoising steps.  200–500 are typical; fewer is faster.
+ddim_steps: 200
+
+# DDIM stochasticity (η).  0.0 = fully deterministic.
+ddim_eta: 0.0
+
+# Save a resume-checkpoint every N batches.
+log_rate: 10
+
+seed: 0
+
+
+# ── Data settings ─────────────────────────────────────────────────────────────
+
+data:
+  root:       "./data"     # MNIST is auto-downloaded here if absent
+  split:      "test"       # "test" (10 000) or "train" (60 000)
+  batch_size: 8
+  image_size: 32           # resize MNIST 28×28 → 32×32 (must be multiple of 32)
+
+
+# ── Target class selection ────────────────────────────────────────────────────
+
+# How to pick the counterfactual target class for each input digit.
+#   "closest"   – use the first entry in MNIST_CLOSEST_CLASS (default)
+#   "random"    – sample a random class ≠ input class
+#   "second_best" – use the class with the second-highest classifier confidence
+target_class_method: "closest"
+
+
+# ── LDCE sampler hyper-parameters ────────────────────────────────────────────
+# These are passed directly to CCMDDIMSampler (ldm/models/diffusion/cc_ddim.py).
+
+sampler:
+  self_recurrence: 0
+  enforce_same_norms: true
+
+  # Gradient projection strategy.
+  # "projected"  → cone-project the classifier gradient onto the CFG direction
+  #                (recommended, keeps CF within the data manifold)
+  # "free"       → classifier gradient added directly (simpler, may be unstable)
+  guidance: "projected"
+
+  cone_projection_type: "zero_binning"
+
+  # Weight for the classifier guidance gradient
+  classifier_lambda: 2.0
+
+  # Weight for the distance regularisation (keeps CF visually close to input)
+  dist_lambda: 0.25
+
+  masked_guidance: false
+  backprop_diffusion: true
+
+  # Distance metric for regularisation.
+  # 1 → L1,  2 → L2,  "dino_cossim" → DINO feature cosine similarity
+  lp_custom: 1
+
+  # Half-angle of the projection cone (degrees).  Smaller → more conservative.
+  deg_cone_projection: 40.
