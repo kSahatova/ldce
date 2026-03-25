@@ -2,7 +2,7 @@
 MNIST LDCE – generate counterfactual explanations for a digit classifier.
 
 Run from the REPOSITORY ROOT:
-    python -m mnist_ldce.run
+    python ldce_mnist.py
 
 What this script does
 ─────────────────────
@@ -20,20 +20,11 @@ Outputs (in output_dir/results/)
   counterfactual/00000.png    – generated counterfactuals
   00000.pth                   – metadata dict with predictions and distances
 
-Requirements
-─────────────
-  • A pretrained MNIST DDPM checkpoint matching the architecture in
-    mnist_ldce/ddpm_mnist.yaml  (ckpt_path in config.yaml).
-  • A pretrained MNIST digit classifier (10 output logits) whose checkpoint
-    path is set in config.yaml.  Edit load_user_classifier() below to match
-    how your checkpoint is saved.
-
-All other settings (sampler hyper-params, batch size, etc.) live in
-mnist_ldce/config.yaml.
+All settings live in mnist_ldce/config.yaml.
 """
 
 import os
-import copy
+import sys
 import random
 import pathlib
 
@@ -41,70 +32,406 @@ import yaml
 import numpy as np
 import torch
 import torch.nn as nn
-from torchvision import transforms
+import torch.nn.functional as F
 from torchvision.utils import save_image
 
-# ── Repo-internal imports (must run from repository root) ─────────────────────
 from sampling_helpers import disabled_train, get_model, _unmap_img
 from ldm.models.diffusion.cc_ddim import CCMDDIMSampler
-from utils.preprocessor import GenericPreprocessing, Normalizer
+from ldm.models.classifiers import SimpleCNNtorch, CNNtorch
+from utils.preprocessor import Normalizer
 
 from mnist_ldce.dataset import MNISTForLDCE, DIGIT_NAMES, MNIST_CLOSEST_CLASS
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Configuration
+# Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
 CONFIG_PATH = r"D:/VSCodeProjects/ldce/mnist_ldce/config.yaml"
 
-# Index of the null/unconditional class in the DDPM's ClassEmbedder.
-# Must be n_classes - 1 from ddpm_mnist.yaml (10 digits → index 10).
+# Null/unconditional class index in the DDPM's ClassEmbedder.
+# Must equal n_classes - 1 from ddpm_mnist.yaml (10 digits → index 10).
 UNCOND_CLASS_IDX = 10
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Classifier loading  ← EDIT THIS FUNCTION
+# Classifier components
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_user_classifier(ckpt_path: str, device: torch.device) -> nn.Module:
-    """Load YOUR pretrained MNIST classifier.
+class ResizeWrapper(nn.Module):
+    """Resize spatial dims and reduce to `out_channels` before classification.
 
-    The classifier must:
-      • accept (B, 3, H, W) float tensors in [0, 1] range
-      • return (B, 10) logits (one per digit class)
-
-    If your model was trained on single-channel images (1, H, W) you can add a
-    grayscale conversion inside the model or replace `image.repeat(3, 1, 1)` in
-    dataset.py with keeping 1 channel and updating this wrapper accordingly.
-
-    Edit one of the examples below to match how your checkpoint is saved,
-    then remove the NotImplementedError.
+    The pipeline operates at `pipeline_size` × `pipeline_size` (e.g. 32×32)
+    while the classifier was trained at `clf_size` × `clf_size` (e.g. 28×28)
+    on `out_channels`-channel images (e.g. 1 for grayscale CNNtorch).
     """
 
-    # ── Example A: the entire model object was saved ──────────────────────────
-    # model = torch.load(ckpt_path, map_location='cpu')
+    def __init__(self, model: nn.Module, clf_size: int, out_channels: int = 1):
+        super().__init__()
+        self.model       = model
+        self.clf_size    = clf_size
+        self.out_channels = out_channels
 
-    # ── Example B: only the state_dict was saved ──────────────────────────────
-    # from your_package import YourMNISTNet
-    # model = YourMNISTNet()
-    # model.load_state_dict(torch.load(ckpt_path, map_location='cpu'))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.interpolate(
+            x, size=(self.clf_size, self.clf_size),
+            mode='bilinear', align_corners=False,
+        )
+        return self.model(x[:, :self.out_channels])
 
-    # ── Example C: checkpoint dict with 'state_dict' or 'model' key ──────────
-    # ckpt = torch.load(ckpt_path, map_location='cpu')
-    # model = YourMNISTNet()
-    # model.load_state_dict(ckpt.get('state_dict', ckpt.get('model', ckpt)))
 
-    raise NotImplementedError(
-        "\nPlease implement load_user_classifier() in mnist_ldce/run.py.\n"
-        f"Checkpoint expected at: {ckpt_path}\n"
-        "The model must accept (B, 3, H, W) tensors in [0, 1] and return (B, 10) logits."
+def load_classifier(classifier_args: dict, ckpt_path: str,
+                    device: torch.device) -> nn.Module:
+    """Load the pretrained MNIST classifier from a checkpoint.
+
+    Handles checkpoints saved from a codebase where the class lived under
+    a 'src/' package by installing a temporary import stub.
+    """
+    import importlib.abc
+    import importlib.machinery
+    import types
+
+    class _AnyObj:
+        def __setstate__(self, state: dict) -> None:
+            self.__dict__.update(state if isinstance(state, dict) else {})
+
+    class _SrcStub(types.ModuleType):
+        def __getattr__(self, _name: str):
+            return _AnyObj
+
+    class _SrcFinder(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path, target=None):  # noqa: ARG002
+            if fullname == 'src' or fullname.startswith('src.'):
+                return importlib.machinery.ModuleSpec(fullname, self)
+        def create_module(self, spec):
+            return _SrcStub(spec.name)
+        def exec_module(self, module):
+            sys.modules[module.__name__] = module
+
+    sys.meta_path.insert(0, _SrcFinder())
+    try:
+        checkpoint = torch.load(
+            ckpt_path, weights_only=False, map_location=torch.device(device)
+        )
+    finally:
+        sys.meta_path.pop(0)
+
+    model = CNNtorch(classifier_args['input_channels'],
+                     classifier_args['num_classes'])
+    model.load_state_dict(checkpoint)
+    return model.to(device).eval()
+
+
+def build_classifier_pipeline(cfg: dict, device: torch.device) -> nn.Module:
+    """Load classifier and apply resize + normalisation wrappers as configured."""
+    model = load_classifier(
+        cfg['classifier_model']['args'],
+        cfg['classifier_model']['ckpt_path'],
+        device,
     )
 
-    return model.to(device).eval()  # noqa: unreachable – replace with your code
+    clf_size      = cfg['classifier_model'].get('input_size', cfg['data']['image_size'])
+    pipeline_size = cfg['data']['image_size']
+    in_channels   = cfg['classifier_model']['args'].get('input_channels', 1)
+
+    if clf_size != pipeline_size or in_channels != 3:
+        print(f"  Classifier: resize {pipeline_size}→{clf_size}, "
+              f"channels 3→{in_channels}")
+        model = ResizeWrapper(model, clf_size, out_channels=in_channels)
+
+    # if cfg['classifier_model'].get('mnist_normalisation', False):
+    #     mean  = [0.1307] * in_channels
+    #     std   = [0.3081] * in_channels
+    #     model = Normalizer(model, mean, std)
+
+    model = model.to(device).eval()
+    model.train = disabled_train
+    return model
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Sampler & dataloader builders
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_sampler(model, classifier: nn.Module,
+                  cfg: dict) -> tuple[CCMDDIMSampler, int]:
+    """Construct CCMDDIMSampler, build its noise schedule, return (sampler, t_enc)."""
+    sampler = CCMDDIMSampler(
+        model,
+        classifier,
+        seg_model                   = None,
+        classifier_wrapper          = cfg['classifier_model'].get('classifier_wrapper', True),
+        record_intermediate_results = cfg.get('record_intermediate_results', False),
+        verbose                     = True,
+        **cfg['sampler'],
+    )
+    sampler.make_schedule(
+        ddim_num_steps = cfg['ddim_steps'],
+        ddim_eta       = cfg['ddim_eta'],
+        verbose        = False,
+    )
+    t_enc = int(cfg['strength'] * len(sampler.ddim_timesteps))
+    return sampler, t_enc
+
+
+def completed_ids(out_dir: str) -> set:
+    """Return the set of MNIST indices that already have a saved .pth result."""
+    return {
+        int(p.stem)
+        for p in pathlib.Path(out_dir).glob('*.pth')
+        if p.stem.isdigit()
+    }
+
+
+def build_dataloader(cfg: dict, out_dir: str,
+                     restart_idx: int = 0) -> torch.utils.data.DataLoader:
+    """Build the MNIST dataset and DataLoader from config, skipping completed samples."""
+    done     = completed_ids(out_dir)
+    dataset  = MNISTForLDCE(
+        root           = cfg['data']['root'],
+        split          = cfg['data']['split'],
+        image_size     = cfg['data']['image_size'],
+        restart_idx    = restart_idx,
+        max_samples    = cfg['data'].get('max_samples', None),
+        filter_classes = cfg['data'].get('filter_classes', None),
+        skip_ids       = done,
+    )
+    print(f"Dataset: {len(dataset)} samples  "
+          f"(split='{cfg['data']['split']}', "
+          f"filter={cfg['data'].get('filter_classes', 'all')}, "
+          f"skipping {len(done)} already completed)")
+    return torch.utils.data.DataLoader(
+        dataset,
+        batch_size  = cfg['data']['batch_size'],
+        shuffle     = False,
+        num_workers = 0,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Target class selection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def pick_target_class(label: int, method: str, logits: torch.Tensor,
+                      fixed_target: int = None) -> int:
+    """Return the counterfactual target class for one input digit.
+
+    Args:
+        label        : true digit class (0–9)
+        method       : 'closest' | 'random' | 'second_best' | 'fixed'
+        logits       : (10,) classifier logits (used only by 'second_best')
+        fixed_target : target class when method == 'fixed'
+    """
+    if method == 'closest':
+        return MNIST_CLOSEST_CLASS[label][0]
+    if method == 'random':
+        return random.choice([c for c in range(10) if c != label])
+    if method == 'second_best':
+        for cls in logits.argsort(descending=True).tolist():
+            if cls != label:
+                return cls
+        return MNIST_CLOSEST_CLASS[label][0]
+    if method == 'fixed':
+        if fixed_target is None:
+            raise ValueError("target_class_method='fixed' requires 'target_class' in config")
+        if fixed_target == label:
+            raise ValueError(
+                f"fixed target_class ({fixed_target}) matches source label ({label})"
+            )
+        return fixed_target
+    raise ValueError(f"Unknown target_class_method: '{method}'")
+
+
+def get_target_classes(labels: torch.Tensor, method: str,
+                       logits: torch.Tensor, fixed_target: int,
+                       device: torch.device) -> torch.Tensor:
+    """Vectorised wrapper: returns (B,) target class tensor."""
+    if method == 'fixed':
+        return torch.full_like(labels, fixed_target)
+    return torch.tensor(
+        [pick_target_class(labels[j].item(), method, logits[j].cpu(), fixed_target)
+         for j in range(len(labels))],
+        device=device,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Classifier evaluation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def evaluate_classifier(classifier: nn.Module, cfg: dict,
+                        device: torch.device) -> dict:
+    """Evaluate classifier top-1 accuracy on the full split (no class filter)."""
+    clf_size = cfg['classifier_model'].get('input_size', cfg['data']['image_size'])
+    split    = cfg['data']['split']
+
+    dataset = MNISTForLDCE(
+        root       = cfg['data']['root'],
+        split      = split,
+        image_size = clf_size,
+    )
+    loader = torch.utils.data.DataLoader(
+        dataset, batch_size=cfg['data']['batch_size'],
+        shuffle=False, num_workers=0,
+    )
+
+    per_class_correct = {c: 0 for c in range(10)}
+    per_class_total   = {c: 0 for c in range(10)}
+
+    with torch.inference_mode():
+        for images, labels, _ in loader:
+            preds = classifier(images.to(device)).argmax(dim=1).cpu()
+            for pred, label in zip(preds.tolist(), labels.tolist()):
+                per_class_total[label]   += 1
+                per_class_correct[label] += int(pred == label)
+
+    n_correct = sum(per_class_correct.values())
+    n_total   = sum(per_class_total.values())
+    accuracy  = n_correct / n_total if n_total > 0 else 0.0
+    per_class_acc = {
+        c: (per_class_correct[c] / per_class_total[c]
+            if per_class_total[c] > 0 else 0.0)
+        for c in range(10)
+    }
+
+    print(f"\nClassifier evaluation — MNIST {split}  ({n_total} images)")
+    print(f"  Overall accuracy : {accuracy * 100:.2f}%  ({n_correct}/{n_total})")
+    for c in range(10):
+        bar = '█' * int(per_class_acc[c] * 20)
+        print(f"    {DIGIT_NAMES[c]:>7} ({c}):  {per_class_acc[c]*100:6.2f}%  {bar}")
+    print()
+
+    return {'accuracy': accuracy, 'per_class_acc': per_class_acc,
+            'n_correct': n_correct, 'n_total': n_total}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Counterfactual generation (one batch)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_counterfactual_batch(
+        model, sampler: CCMDDIMSampler,
+        images: torch.Tensor, target_y: torch.Tensor,
+        scale: float, t_enc: int, seed: int,
+) -> tuple[torch.Tensor, list]:
+    """Encode → add noise → guided denoise → decode for one batch.
+
+    Returns:
+        cf_images : (B, C, H, W) counterfactual images in [0, 1]
+        probs     : list of per-image target-class probabilities (or empty list)
+    """
+    sampler.init_images = images.clone()
+
+    init_latent = model.get_first_stage_encoding(
+        model.encode_first_stage(_unmap_img(images))
+    )
+
+    batch_size = target_y.shape[0]
+
+    with torch.no_grad(), model.ema_scope():
+        uc = model.get_learned_conditioning({
+            model.cond_stage_key: torch.tensor(
+                batch_size * [UNCOND_CLASS_IDX]
+            ).to(model.device)
+        })
+        c = model.get_learned_conditioning({
+            model.cond_stage_key: target_y.to(model.device)
+        })
+
+        torch.manual_seed(seed)
+        z_enc = sampler.stochastic_encode(
+            init_latent,
+            torch.tensor([t_enc] * batch_size).to(init_latent.device),
+            noise=torch.randn_like(init_latent),
+        )
+
+        torch.manual_seed(seed)
+        out = sampler.decode(
+            z_enc, c, t_enc,
+            unconditional_guidance_scale = scale,
+            unconditional_conditioning   = uc,
+            y                            = target_y.to(model.device),
+            latent_t_0                   = False,
+        )
+
+    cf_images = torch.clamp(
+        (model.decode_first_stage(out["x_dec"]) + 1.0) / 2.0, 0.0, 1.0
+    )
+    probs = out.get("prob") or []
+    return cf_images, probs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Result saving (one batch)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def save_batch(
+        out_dir: str,
+        unique_ids: torch.Tensor,
+        src_images: torch.Tensor,
+        cf_images:  torch.Tensor,
+        labels:     torch.Tensor,
+        tgt_classes: torch.Tensor,
+        logits_in:  torch.Tensor,
+        logits_out: torch.Tensor,
+        probs:      list,
+        save_only_successful: bool = True,
+) -> int:
+    """Persist originals, counterfactuals and metadata for one batch.
+
+    Args:
+        save_only_successful: when True, skip samples where the counterfactual
+                              did not flip the classifier to the target class.
+    Returns:
+        Number of samples actually saved.
+    """
+    softmax_in  = logits_in.softmax(dim=1).cpu()
+    softmax_out = logits_out.softmax(dim=1).cpu()
+    in_pred     = logits_in.argmax(dim=1).cpu()
+    out_pred    = logits_out.argmax(dim=1).cpu()
+
+    saved = 0
+    for j in range(len(unique_ids)):
+        uidx      = unique_ids[j].item()
+        src       = src_images[j].cpu()
+        cf        = cf_images[j].cpu()
+        tgt       = tgt_classes[j].item()
+        lbl       = labels[j].item()
+        diff      = src - cf
+
+        if save_only_successful and out_pred[j].item() != tgt:
+            continue
+
+        data_dict = {
+            "unique_id":         uidx,
+            "image":             src,
+            "gen_image":         cf,
+            "source":            DIGIT_NAMES[lbl],
+            "target":            DIGIT_NAMES[tgt],
+            "in_pred":           DIGIT_NAMES[in_pred[j].item()],
+            "out_pred":          DIGIT_NAMES[out_pred[j].item()],
+            "in_confid":         softmax_in[j].max().item(),
+            "out_confid":        softmax_out[j].max().item(),
+            "in_tgt_confid":     softmax_in[j, tgt].item(),
+            "out_tgt_confid":    softmax_out[j, tgt].item(),
+            "target_confidence": probs[j] if probs else softmax_out[j, tgt].item(),
+            "closeness_l1":      torch.norm(diff, p=1).item(),
+            "closeness_l2":      torch.norm(diff, p=2).item(),
+        }
+
+        fname = str(uidx).zfill(5)
+        torch.save(data_dict,
+                   os.path.join(out_dir, f'{fname}.pth'))
+        save_image(src.clamp(0, 1),
+                   os.path.join(out_dir, 'original', f'{fname}.png'))
+        save_image(cf.clamp(0, 1),
+                   os.path.join(out_dir, 'counterfactual', f'{fname}.png'))
+        saved += 1
+
+    return saved
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Utilities
 # ─────────────────────────────────────────────────────────────────────────────
 
 def set_seed(seed: int = 0) -> None:
@@ -119,109 +446,13 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def pick_target_class(label: int, method: str, logits: torch.Tensor) -> int:
-    """Return the counterfactual target class for one input digit.
-
-    Args:
-        label  : true digit class (0–9)
-        method : 'closest' | 'random' | 'second_best'
-        logits : (10,) classifier logits for this image (used by 'second_best')
-    """
-    if method == 'closest':
-        return MNIST_CLOSEST_CLASS[label][0]
-    elif method == 'random':
-        return random.choice([c for c in range(10) if c != label])
-    elif method == 'second_best':
-        sorted_classes = logits.argsort(descending=True).tolist()
-        for cls in sorted_classes:
-            if cls != label:
-                return cls
-        return MNIST_CLOSEST_CLASS[label][0]
-    else:
-        raise ValueError(f"Unknown target_class_method: '{method}'")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MNIST-specific sample generation
-# ─────────────────────────────────────────────────────────────────────────────
-
-def generate_samples_mnist(
-        model, sampler, target_y: torch.Tensor,
-        ddim_steps: int, scale: float,
-        init_latent: torch.Tensor, t_enc: int,
-        seed: int = 0) -> dict:
-    """MNIST-adapted version of sampling_helpers.generate_samples().
-
-    The only functional difference from the original is that the unconditional
-    class index is UNCOND_CLASS_IDX (= 10) instead of the ImageNet-hardcoded
-    1000.  Everything else is identical.
-
-    Returns a dict with keys: 'samples', 'probs', 'videos', 'masks', 'cgs'.
-    """
-    torch.cuda.empty_cache()
-    batch_size = target_y.shape[0]
-
-    with torch.no_grad():
-        with model.ema_scope():
-            # Unconditional conditioning: null class (index 10)
-            uc = model.get_learned_conditioning({
-                model.cond_stage_key: torch.tensor(
-                    batch_size * [UNCOND_CLASS_IDX]
-                ).to(model.device)
-            })
-            # Target-class conditioning
-            c = model.get_learned_conditioning({
-                model.cond_stage_key: target_y.to(model.device)
-            })
-
-            # Forward diffusion: add noise up to timestep t_enc
-            torch.manual_seed(seed)
-            noise = torch.randn_like(init_latent)
-            z_enc = sampler.stochastic_encode(
-                init_latent,
-                torch.tensor([t_enc] * batch_size).to(init_latent.device),
-                noise=noise
-            )
-
-            torch.manual_seed(seed)
-
-            # Reverse diffusion with classifier + distance guidance
-            out = sampler.decode(
-                z_enc, c, t_enc,
-                unconditional_guidance_scale=scale,
-                unconditional_conditioning=uc,
-                y=target_y.to(model.device),
-                latent_t_0=False,
-            )
-
-    samples = out["x_dec"]
-    prob    = out.get("prob")
-    vid     = out.get("video")
-    mask    = out.get("mask")
-    cg      = out.get("concensus_regions")
-
-    # Decode from latent / pixel space and clip to [0, 1]
-    # For IdentityFirstStage this is just (x + 1) / 2 (un-mapping from [-1,1])
-    x_samples = model.decode_first_stage(samples)
-    x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
-
-    return {
-        "samples": [x_samples],
-        "probs":   [prob]  if prob is not None else None,
-        "videos":  [vid]   if vid  is not None else None,
-        "masks":   [mask]  if mask is not None else None,
-        "cgs":     [cg]    if cg   is not None else None,
-    }
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    cfg = load_config(CONFIG_PATH)
-
-    seed = cfg.get('seed', 0)
+    cfg    = load_config(CONFIG_PATH)
+    seed   = cfg.get('seed', 0)
     set_seed(seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -229,207 +460,85 @@ def main() -> None:
 
     # ── Output directories ────────────────────────────────────────────────────
     out_dir         = os.path.join(cfg['output_dir'], "results")
-    checkpoint_path = os.path.join(out_dir, "last_saved_id.pth")
-    os.makedirs(out_dir, exist_ok=True)
+    resume_ckpt     = os.path.join(out_dir, "last_saved_id.pth")
+    pathlib.Path(os.path.join(out_dir, 'original')).mkdir(parents=True, exist_ok=True)
+    pathlib.Path(os.path.join(out_dir, 'counterfactual')).mkdir(parents=True, exist_ok=True)
 
-    # ── Resume support ────────────────────────────────────────────────────────
+    # ── Resume ────────────────────────────────────────────────────────────────
     last_data_idx = 0
-    if cfg.get('resume', False) and os.path.exists(checkpoint_path):
-        ckpt = torch.load(checkpoint_path, map_location='cpu')
-        last_data_idx = ckpt.get("last_data_idx", -1) + 1
+    if cfg.get('resume', False) and os.path.exists(resume_ckpt):
+        last_data_idx = torch.load(resume_ckpt, map_location='cpu').get("last_data_idx", -1) + 1
         print(f"Resuming from sample index {last_data_idx}")
 
-    # ── Diffusion model ───────────────────────────────────────────────────────
+    # ── Models ────────────────────────────────────────────────────────────────
+    print("Loading MNIST classifier …")
+    classifier = build_classifier_pipeline(cfg, device)
+
     print("Loading MNIST diffusion model …")
-    model = get_model(
+    diff_model = get_model(
         cfg_path  = cfg['diffusion_model']['cfg_path'],
         ckpt_path = cfg['diffusion_model']['ckpt_path'],
     ).to(device).eval()
 
-    # ── Classifier ───────────────────────────────────────────────────────────
-    print("Loading MNIST classifier …")
-    classifier_raw = load_user_classifier(
-        ckpt_path = cfg['classifier_model']['ckpt_path'],
-        device    = device,
-    )
+    # ── Optional classifier quality check ─────────────────────────────────────
+    if cfg.get('evaluate_classifier', True):
+        evaluate_classifier(classifier, cfg, device)
 
-    # The CCMDDIMSampler calls get_classifier_logits(pred_x0) internally, which
-    # maps pred_x0 from [-1, 1] → [0, 1] before calling self.classifier(x).
-    # So the classifier always receives [0, 1] images.
-    #
-    # If your classifier additionally requires per-channel MNIST normalisation
-    # (mean=0.1307, std=0.3081), enable mnist_normalisation in config.yaml.
-    if cfg['classifier_model'].get('mnist_normalisation', False):
-        mean = [0.1307] * 3
-        std  = [0.3081] * 3
-        classifier_model = Normalizer(classifier_raw, mean, std)
-    else:
-        classifier_model = classifier_raw
+    # ── Sampler & data ────────────────────────────────────────────────────────
+    sampler, t_enc = build_sampler(diff_model, classifier, cfg)
+    data_loader    = build_dataloader(cfg, out_dir, restart_idx=last_data_idx)
 
-    classifier_model = classifier_model.to(device).eval()
-    classifier_model.train = disabled_train  # freeze train/eval toggle
+    target_method        = cfg.get('target_class_method', 'closest')
+    fixed_target         = cfg.get('target_class', None)
+    log_rate             = cfg.get('log_rate', 10)
+    batch_size           = cfg['data']['batch_size']
+    save_only_successful = cfg.get('save_only_successful', True)
 
-    # ── CCMDDIMSampler ────────────────────────────────────────────────────────
-    sampler_cfg = cfg['sampler']
-    ddim_steps  = cfg['ddim_steps']
-    ddim_eta    = cfg['ddim_eta']
-    scale       = cfg['scale']
-    strength    = cfg['strength']
-
-    sampler = CCMDDIMSampler(
-        model,
-        classifier_model,
-        seg_model                  = None,
-        classifier_wrapper         = cfg['classifier_model'].get('classifier_wrapper', True),
-        record_intermediate_results= cfg.get('record_intermediate_results', False),
-        verbose                    = True,
-        **sampler_cfg,
-    )
-    sampler.make_schedule(ddim_num_steps=ddim_steps, ddim_eta=ddim_eta, verbose=False)
-
-    t_enc      = int(strength * len(sampler.ddim_timesteps))
-    batch_size = cfg['data']['batch_size']
-
-    # ── Dataset & DataLoader ──────────────────────────────────────────────────
-    dataset = MNISTForLDCE(
-        root        = cfg['data']['root'],
-        split       = cfg['data']['split'],
-        image_size  = cfg['data']['image_size'],
-        restart_idx = last_data_idx,
-    )
-    print(f"Dataset: {len(dataset)} samples (split='{cfg['data']['split']}')")
-
-    data_loader = torch.utils.data.DataLoader(
-        dataset, batch_size=batch_size, shuffle=False, num_workers=0
-    )
-
-    target_method = cfg.get('target_class_method', 'closest')
-    log_rate      = cfg.get('log_rate', 10)
+    total_saved = 0
 
     # ── Generation loop ───────────────────────────────────────────────────────
-    for i, (image, label, unique_data_idx) in enumerate(data_loader):
-        image = image.to(device)   # (B, 3, 32, 32) in [0, 1]
-        label = label.to(device)
+    for i, (images, labels, unique_ids) in enumerate(data_loader):
+        images = images.to(device)
+        labels = labels.to(device)
 
-        cur_batch = image.shape[0]
-
-        # Initial classifier predictions (input images are already [0, 1])
         with torch.inference_mode():
-            logits_in = classifier_model(image)   # (B, 10)
-            in_class_pred = logits_in.argmax(dim=1)
-            in_confid     = logits_in.softmax(dim=1).max(dim=1).values
+            logits_in = classifier(images)
 
-        # Select counterfactual target classes
-        tgt_classes = torch.tensor([
-            pick_target_class(
-                label[j].item(),
-                method=target_method,
-                logits=logits_in[j].cpu(),
-            )
-            for j in range(cur_batch)
-        ]).to(device)
-
-        in_confid_tgt = logits_in.softmax(dim=1)[
-            torch.arange(cur_batch), tgt_classes
-        ]
-
-        for j in range(cur_batch):
-            src_name = DIGIT_NAMES[label[j].item()]
-            tgt_name = DIGIT_NAMES[tgt_classes[j].item()]
-            print(f"  [{i * batch_size + j:05d}] {src_name} → {tgt_name}")
-
-        # Set reference images for the distance regulariser (must be [0, 1])
-        sampler.init_images = image.clone()
-        sampler.init_labels = label
-
-        # Encode into pixel / latent space: _unmap_img maps [0,1] → [-1,1]
-        init_latent = model.get_first_stage_encoding(
-            model.encode_first_stage(_unmap_img(image))
+        tgt_classes = get_target_classes(
+            labels, target_method, logits_in, fixed_target, device
         )
 
-        # Generate counterfactuals
-        out = generate_samples_mnist(
-            model, sampler, tgt_classes,
-            ddim_steps, scale,
-            init_latent = init_latent,
-            t_enc       = t_enc,
-            seed        = seed,
+        for j in range(len(labels)):
+            print(f"  [{i * batch_size + j:05d}] "
+                  f"{DIGIT_NAMES[labels[j].item()]} → "
+                  f"{DIGIT_NAMES[tgt_classes[j].item()]}")
+
+        cf_images, probs = generate_counterfactual_batch(
+            diff_model, sampler, images, tgt_classes,
+            cfg['scale'], t_enc, seed,
         )
 
-        all_samples = out["samples"]   # list of (B, 3, 32, 32) tensors in [0, 1]
-        all_probs   = out["probs"]
-
-        # Evaluate output images
         with torch.inference_mode():
-            logits_out    = classifier_model(all_samples[0])
-            out_class_pred = logits_out.argmax(dim=1)
-            out_confid     = logits_out.softmax(dim=1).max(dim=1).values
-            out_confid_tgt = logits_out.softmax(dim=1)[
-                torch.arange(cur_batch), tgt_classes
-            ]
+            logits_out = classifier(cf_images)
 
-        print(f"  Input  preds: {in_class_pred.tolist()}, "
-              f"conf: {[f'{v:.2f}' for v in in_confid.tolist()]}")
-        print(f"  Output preds: {out_class_pred.tolist()}, "
-              f"conf: {[f'{v:.2f}' for v in out_confid.tolist()]}")
+        print(f"  Input  preds: {logits_in.argmax(1).tolist()},  "
+              f"conf: {[f'{v:.2f}' for v in logits_in.softmax(1).max(1).values.tolist()]}")
+        print(f"  Output preds: {logits_out.argmax(1).tolist()},  "
+              f"conf: {[f'{v:.2f}' for v in logits_out.softmax(1).max(1).values.tolist()]}")
 
-        # Save results
-        pathlib.Path(os.path.join(out_dir, 'original')).mkdir(
-            parents=True, exist_ok=True)
-        pathlib.Path(os.path.join(out_dir, 'counterfactual')).mkdir(
-            parents=True, exist_ok=True)
+        n_saved = save_batch(
+            out_dir, unique_ids, images, cf_images,
+            labels, tgt_classes, logits_in, logits_out, probs,
+            save_only_successful=save_only_successful,
+        )
+        total_saved += n_saved
+        print(f"  Saved {n_saved}/{len(labels)} this batch  "
+              f"(total: {total_saved})")
 
-        for j in range(cur_batch):
-            uidx      = unique_data_idx[j].item()
-            src_image = sampler.init_images[j].cpu()
-            gen_image = all_samples[0][j].cpu()
-            diff      = src_image - gen_image
-
-            data_dict = {
-                "unique_id":         uidx,
-                "image":             src_image,
-                "gen_image":         gen_image,
-                "source":            DIGIT_NAMES[label[j].item()],
-                "target":            DIGIT_NAMES[tgt_classes[j].item()],
-                "in_pred":           DIGIT_NAMES[in_class_pred[j].item()],
-                "out_pred":          DIGIT_NAMES[out_class_pred[j].item()],
-                "in_confid":         in_confid[j].cpu().item(),
-                "out_confid":        out_confid[j].cpu().item(),
-                "in_tgt_confid":     in_confid_tgt[j].cpu().item(),
-                "out_tgt_confid":    out_confid_tgt[j].cpu().item(),
-                "target_confidence": (
-                    all_probs[0][j]
-                    if all_probs is not None
-                    else out_confid_tgt[j].cpu().item()
-                ),
-                "closeness_l1": int(
-                    torch.norm(diff, p=1, dim=-1).mean().item()
-                ),
-                "closeness_l2": int(
-                    torch.norm(diff, p=2, dim=-1).mean().item()
-                ),
-            }
-
-            torch.save(
-                data_dict,
-                os.path.join(out_dir, f'{str(uidx).zfill(5)}.pth')
-            )
-            save_image(
-                src_image.clamp(0, 1),
-                os.path.join(out_dir, 'original', f'{str(uidx).zfill(5)}.png')
-            )
-            save_image(
-                gen_image.clamp(0, 1),
-                os.path.join(out_dir, 'counterfactual', f'{str(uidx).zfill(5)}.png')
-            )
-
-        # Periodic checkpoint for resuming
         if (i + 1) % log_rate == 0:
-            last_idx = unique_data_idx[-1].item()
-            torch.save({"last_data_idx": last_idx}, checkpoint_path)
-            print(f"  Checkpoint saved (last sample index: {last_idx})")
-
-        del out
+            last_idx = unique_ids[-1].item()
+            torch.save({"last_data_idx": last_idx}, resume_ckpt)
+            print(f"  Checkpoint saved (last index: {last_idx})")
 
 
 if __name__ == "__main__":

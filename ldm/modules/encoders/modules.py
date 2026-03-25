@@ -1,11 +1,9 @@
 import torch
 import torch.nn as nn
 from functools import partial
-import clip
 from einops import rearrange, repeat
-from transformers import CLIPTokenizer, CLIPTextModel
+import clip 
 import kornia
-
 from ldm.modules.x_transformer import Encoder, TransformerWrapper  # TODO: can we directly rely on lucidrains code and simply add this as a reuirement? --> test
 
 
@@ -138,6 +136,8 @@ class FrozenCLIPEmbedder(AbstractEncoder):
     """Uses the CLIP transformer encoder for text (from Hugging Face)"""
     def __init__(self, version="openai/clip-vit-large-patch14", device="cuda", max_length=77):
         super().__init__()
+        from transformers import CLIPTokenizer, CLIPTextModel
+
         self.tokenizer = CLIPTokenizer.from_pretrained(version)
         self.transformer = CLIPTextModel.from_pretrained(version)
         self.device = device
@@ -168,6 +168,7 @@ class FrozenCLIPTextEmbedder(nn.Module):
     """
     def __init__(self, version='ViT-L/14', device="cuda", max_length=77, n_repeat=1, normalize=True):
         super().__init__()
+
         self.model, _ = clip.load(version, jit=False, device="cpu")
         self.device = device
         self.max_length = max_length
@@ -206,6 +207,7 @@ class FrozenClipImageEmbedder(nn.Module):
             antialias=False,
         ):
         super().__init__()
+
         self.model, _ = clip.load(name=model, device=device, jit=jit)
 
         self.antialias = antialias

@@ -15,8 +15,8 @@ import bisect
 
 from ldm.util import instantiate_from_config
 from huggingface_hub import hf_hub_download
-from groundingdino.util.utils import get_phrases_from_posmap
-from groundingdino.util.slconfig import SLConfig
+
+# from groundingdino.util.slconfig import SLConfig
 
 
 
@@ -54,6 +54,8 @@ def predict(
         device: str = "cuda",
         remove_combined: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
+    from groundingdino.util.utils import get_phrases_from_posmap
+
     caption = preprocess_caption(caption=caption)
 
     model = model.to(device)
@@ -149,7 +151,7 @@ def draw_mask(mask, image, random_color=True):
 # @title loading utils
 def load_model_from_config(config, ckpt):
     print(f"Loading model from {ckpt}")
-    pl_sd = torch.load(ckpt)  # , map_location="cpu")
+    pl_sd = torch.load(ckpt, map_location="cpu" if not torch.cuda.is_available() else 'cuda')
     sd = pl_sd["state_dict"]
     model = instantiate_from_config(config.model)
     m, u = model.load_state_dict(sd, strict=False)

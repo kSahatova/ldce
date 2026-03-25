@@ -7,6 +7,8 @@
 
 resume: false                   # set true to continue an interrupted run
 record_intermediate_results: false
+evaluate_classifier: false      # run accuracy eval on the data split before generation
+save_only_successful: true      # only save samples where CF flipped the classifier to target
 output_dir: ./results/mnist_ldce
 
 
@@ -15,12 +17,24 @@ output_dir: ./results/mnist_ldce
 diffusion_model:
   # Architecture config – keep in sync with the checkpoint below
   cfg_path:  "mnist_ldce/ddpm_mnist.yaml"
-  # ↓ UPDATE: path to your pretrained MNIST DDPM checkpoint (.ckpt / .pt)
-  ckpt_path: "/path/to/your/mnist_ddpm.ckpt"
+  # train_ddpm.py saves: checkpoints/mnist_ddpm/last.ckpt  and  mnist_ddpm_best.ckpt
+  ckpt_path: "./checkpoints/mnist_ddpm/mnist_ddpm_best-v1.ckpt"
 
 classifier_model:
-  # ↓ UPDATE: path to your pretrained MNIST digit classifier (.pth / .pt)
-  ckpt_path: "/path/to/your/mnist_classifier.pth"
+  args:
+      input_channels: 1 # number of input channels
+      in_conv_channels: [1, 8, 16] 
+      out_conv_channels: [8, 16, 32]
+      conv_kernels: [5, 5, 3]
+      softmax_flag: True
+      num_classes: 10
+
+  # Resolution the classifier was trained on. If this differs from
+  # data.image_size, images are bilinearly resized before classification.
+  input_size: 28
+
+  ckpt_path: "./checkpoints/classifier/classifier_mnist.pth"
+  # ckpt_path: "./checkpoints/classifier/binary_mnist_1_7_epoch=00_val_accuracy=0.99.pth"
 
   # true  → your classifier accepts raw [0, 1] images and handles its own
   #          normalization internally (most common case for MNIST CNNs).
@@ -62,10 +76,24 @@ seed: 0
 # ── Data settings ─────────────────────────────────────────────────────────────
 
 data:
-  root:       "./data"     # MNIST is auto-downloaded here if absent
-  split:      "test"       # "test" (10 000) or "train" (60 000)
-  batch_size: 8
-  image_size: 32           # resize MNIST 28×28 → 32×32 (must be multiple of 32)
+  root:        "./data"    # MNIST is auto-downloaded here if absent
+  split:       "test"      # "test" (10 000) or "train" (60 000)
+  batch_size:  8
+  image_size:  32          # resize MNIST 28×28 → 32×32 (must be multiple of 32)
+  num_workers: 4           # DataLoader workers (set to 0 if multiprocessing causes issues)
+  max_samples: 100         # total images to process (class-balanced when filter_classes is set)
+  filter_classes: [0, 3, 4, 5, 9]  # only include these digit classes (null = all classes)
+
+
+# ── Input perturbation ────────────────────────────────────────────────────────
+# When enabled, counterfactuals are also generated for a noisy version of each
+# input, allowing robustness comparison between original and perturbed CFs.
+
+perturbation:
+  enabled:   true
+  type:      gaussian   # gaussian | uniform
+  std:       0.1        # noise std for gaussian
+  magnitude: 0.1        # noise half-range for uniform
 
 
 # ── Target class selection ────────────────────────────────────────────────────
@@ -74,7 +102,12 @@ data:
 #   "closest"   – use the first entry in MNIST_CLOSEST_CLASS (default)
 #   "random"    – sample a random class ≠ input class
 #   "second_best" – use the class with the second-highest classifier confidence
-target_class_method: "closest"
+# "closest" | "random" | "second_best" | "fixed"
+# Use "fixed" together with `target_class` below to force a specific target digit.
+target_class_method: "fixed"
+
+# Target digit class when target_class_method is "fixed" (0–9).
+target_class: 8
 
 
 # ── LDCE sampler hyper-parameters ────────────────────────────────────────────

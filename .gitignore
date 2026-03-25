@@ -5,3 +5,10 @@ latent_diffusion.egg*
 models/ldm
 .vscode
 .idea
+.claude
+output_dir
+taming
+checkpoints
+data/MNIST/raw
+GroumdingDINO
+taming-transformers
