@@ -28,6 +28,7 @@ import pickle
 import random
 import sys
 import types
+import easydict
 
 import numpy as np
 from numpy.random import multivariate_normal, uniform
@@ -494,7 +495,7 @@ def save_results_pkl(pkl_path: str, records: list[dict]) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main(cfg: dict, device: torch.device) -> None:
-    seed = cfg.get("seed", 0)
+    seed = cfg.get("seed", 10)
     set_seed(seed)
 
     out_dir        = cfg["output_dir"]
@@ -503,22 +504,14 @@ def main(cfg: dict, device: torch.device) -> None:
     save_only_succ = cfg.get("save_only_successful", True)
 
     prepare_output_dirs(out_dir)
-    tracker  = CompletedTracker(os.path.join(out_dir, "completed.txt"))
-    pkl_path = os.path.join(out_dir, "results.pkl")
-    records  = load_results_pkl(pkl_path)
-    print(f"  results.pkl: {len(records)} records already saved")
+    tracker = CompletedTracker(os.path.join(out_dir, "completed.txt"))
 
-    # ── Models ────────────────────────────────────────────────────────────────
-    print("Loading classifier …")
-    classifier = build_classifier(cfg, device)
-
-    print("Loading diffusion model …")
-    diff_model = build_diffusion_model(cfg, device)
-
-    if cfg.get("evaluate_classifier", False):
-        evaluate_classifier(classifier, cfg, device)
-
-    sampler, t_enc = build_sampler(diff_model, classifier, cfg)
+    pkl_path_orig = os.path.join(out_dir, "results_original.pkl")
+    pkl_path_pert = os.path.join(out_dir, "results_perturbed.pkl")
+    records_orig  = load_results_pkl(pkl_path_orig)
+    records_pert  = load_results_pkl(pkl_path_pert)
+    print(f"  results_original.pkl : {len(records_orig)} records already saved")
+    print(f"  results_perturbed.pkl: {len(records_pert)} records already saved")
 
     # ── Dataset ───────────────────────────────────────────────────────────────
     dataset = MNISTForLDCE(
@@ -542,8 +535,20 @@ def main(cfg: dict, device: torch.device) -> None:
 
     target_method = cfg.get("target_class_method", "closest")
     fixed_target  = cfg.get("target_class")
-    batch_size    = cfg["data"]["batch_size"]
-    total_saved   = 0
+    total_orig    = 0
+    total_pert    = 0
+
+    # ── Models ────────────────────────────────────────────────────────────────
+    print("Loading classifier …")
+    classifier = build_classifier(cfg, device)
+
+    print("Loading diffusion model …")
+    diff_model = build_diffusion_model(cfg, device)
+
+    if cfg.get("evaluate_classifier", False):
+        evaluate_classifier(classifier, cfg, device)
+
+    sampler, t_enc = build_sampler(diff_model, classifier, cfg)
 
     # ── Generation loop ───────────────────────────────────────────────────────
     for i, (images, labels, unique_ids) in enumerate(loader):
@@ -557,11 +562,6 @@ def main(cfg: dict, device: torch.device) -> None:
             labels, logits_in, target_method, fixed_target, device
         )
 
-        for j in range(len(labels)):
-            print(f"  [{i * batch_size + j:05d}]  "
-                  f"{DIGIT_NAMES[labels[j].item()]} → "
-                  f"{DIGIT_NAMES[tgt_classes[j].item()]}")
-
         # ── Original counterfactuals ──────────────────────────────────────────
         cf_orig = generate_cf(
             diff_model, sampler, images, tgt_classes,
@@ -571,72 +571,89 @@ def main(cfg: dict, device: torch.device) -> None:
         with torch.inference_mode():
             logits_cf_orig = classifier(cf_orig)
 
-        # ── Perturbed counterfactuals ─────────────────────────────────────────
-        cf_pert          = None
-        logits_perturbed = None
-        logits_cf_pert   = None
-        perturbed        = None
+        sm_in      = logits_in.softmax(dim=1).cpu()
+        sm_cf_orig = logits_cf_orig.softmax(dim=1).cpu()
 
-        if with_pert:
-            # perturb_sample works on numpy (B, C, H, W); n_samples=1 so we
-            # squeeze the samples axis to get back (B, C, H, W).
-            images_np = images.cpu().numpy()
-            perturbed_np = perturb_sample(
-                images_np,
-                n_samples    = 1,
-                type         = pert_cfg.get("type", "uniform"),
-                epsilon      = pert_cfg.get("magnitude", 0.1),
-                channels_last= False,
-                std          = pert_cfg.get("std", 0.1),
-                noise_seed   = pert_cfg.get("noise_seed"),
-            )                                          # (B, 1, C, H, W)
-            perturbed = torch.from_numpy(
-                perturbed_np[:, 0]                     # (B, C, H, W)
-            ).to(device)
-            cf_pert   = generate_cf(
-                diff_model, sampler, perturbed, tgt_classes,
-                cfg["scale"], t_enc, seed,
-            )
-            with torch.inference_mode():
-                logits_perturbed = classifier(perturbed)
-                logits_cf_pert   = classifier(cf_pert)
-
-        # ── Save & track ──────────────────────────────────────────────────────
-        sm_in       = logits_in.softmax(dim=1).cpu()
-        sm_cf_orig  = logits_cf_orig.softmax(dim=1).cpu()
-        sm_pert     = logits_perturbed.softmax(dim=1).cpu() if logits_perturbed is not None else None
-        sm_cf_pert  = logits_cf_pert.softmax(dim=1).cpu()  if logits_cf_pert   is not None else None
-
-        batch_saved = 0
+        # ── Collect original records ──────────────────────────────────────────
+        batch_orig = []
         for j in range(len(labels)):
-            uidx = unique_ids[j].item()
-            tgt  = tgt_classes[j].item()
+            uidx  = unique_ids[j].item()
+            tgt   = tgt_classes[j].item()
+            label = labels[j].item()
 
-            record = save_sample(
-                out_dir,
-                uidx,
-                src              = images[j].cpu(),
-                cf_orig          = cf_orig[j].cpu(),
-                label            = labels[j].item(),
-                tgt              = tgt,
-                softmax_in       = sm_in[j],
-                softmax_cf_orig  = sm_cf_orig[j],
-                cf_pert          = cf_pert[j].cpu()          if cf_pert          is not None else None,
-                perturbed        = perturbed[j].cpu()        if perturbed        is not None else None,
-                softmax_perturbed= sm_pert[j]                if sm_pert          is not None else None,
-                softmax_cf_pert  = sm_cf_pert[j]             if sm_cf_pert       is not None else None,
-                save_only_successful=save_only_succ,
-            )
+            orig_success = sm_cf_orig[j].argmax().item() == tgt
             tracker.mark_done(uidx)
-            if record is not None:
-                records.append(record)
-                batch_saved += 1
+            if save_only_succ and not orig_success:
+                continue
 
-        save_results_pkl(pkl_path, records)
-        total_saved += batch_saved
-        print(f"  Saved {batch_saved}/{len(labels)} this batch  "
-              f"(total: {total_saved}, pkl: {len(records)} records)")
-        print(f"  orig  preds: {logits_in.argmax(1).tolist()}  →  "
+            batch_orig.append({
+                "unique_id": uidx,
+                "source":    DIGIT_NAMES[label],
+                "target":    DIGIT_NAMES[tgt],
+                "image":     images[j].cpu(),
+                "image_cf":  cf_orig[j].cpu(),
+            })
+
+        # ── Perturbed counterfactuals (one record per sample × epsilon) ───────
+        batch_pert = []
+        if with_pert:
+            epsilon_list = pert_cfg.get("magnitude", [0.1])
+            pert_type    = pert_cfg.get("type", "uniform")
+            images_np    = images.cpu().numpy()
+
+            for epsilon in epsilon_list:
+                print(f'Perturbing original images with the noise bounded by eps={epsilon}')
+                # perturb_sample returns (B, n_samples, C, H, W); n_samples=1
+                perturbed_np = perturb_sample(
+                    images_np,
+                    n_samples     = 1,
+                    type          = pert_type,
+                    epsilon       = epsilon,
+                    channels_last = False,
+                    std           = pert_cfg.get("std", 0.1),
+                    noise_seed    = pert_cfg.get("noise_seed"),
+                )                                          # → (B, 1, C, H, W)
+                perturbed = torch.from_numpy(
+                    perturbed_np[:, 0]                     # → (B, C, H, W)
+                ).to(device)
+
+                cf_pert = generate_cf(
+                    diff_model, sampler, perturbed, tgt_classes,
+                    cfg["scale"], t_enc, seed,
+                )
+                with torch.inference_mode():
+                    logits_cf_pert = classifier(cf_pert)
+
+                sm_cf_pert = logits_cf_pert.softmax(dim=1).cpu()
+
+                for j in range(len(labels)):
+                    tgt   = tgt_classes[j].item()
+                    label = labels[j].item()
+
+                    pert_success = sm_cf_pert[j].argmax().item() == tgt
+                    if save_only_succ and not pert_success:
+                        continue
+
+                    batch_pert.append({
+                        "unique_id":         unique_ids[j].item(),
+                        "epsilon":           epsilon,
+                        "source":            DIGIT_NAMES[label],
+                        "target":            DIGIT_NAMES[tgt],
+                        "image_perturbed":   perturbed[j].cpu(),
+                        "image_cf_perturbed": cf_pert[j].cpu(),
+                    })
+
+        # ── Persist & report ──────────────────────────────────────────────────
+        records_orig.extend(batch_orig)
+        records_pert.extend(batch_pert)
+        save_results_pkl(pkl_path_orig, records_orig)
+        save_results_pkl(pkl_path_pert, records_pert)
+
+        total_orig += len(batch_orig)
+        total_pert += len(batch_pert)
+        print(f"  Batch {i}: +{len(batch_orig)} orig, +{len(batch_pert)} pert  "
+              f"(running totals — orig: {total_orig}, pert: {total_pert})")
+        print(f"  orig preds: {logits_in.argmax(1).tolist()}  →  "
               f"{logits_cf_orig.argmax(1).tolist()}")
 
 
@@ -653,7 +670,9 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    args   = parse_args()
+    # args   = parse_args()
+    args = easydict.EasyDict({'config': 'ldce_mnist/mnist_ldce/configs/mnist/config_ldce_mnist.yaml',
+            'device': 'cpu'})
     cfg    = load_config(args.config)
     device = torch.device(
         args.device if args.device else

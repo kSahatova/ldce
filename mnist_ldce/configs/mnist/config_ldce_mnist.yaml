@@ -15,14 +15,14 @@
 resume: false
 record_intermediate_results: false
 evaluate_classifier: false
-save_only_successful: true
-output_dir: mnist_ldce/results
+save_only_successful: false
+output_dir: mnist_ldce/results/mnist/multiclass
 
 
 # ── Model paths ───────────────────────────────────────────────────────────────
 
 diffusion_model:
-  cfg_path:  "mnist_ldce/configs/ldm_mnist.yaml"
+  cfg_path:  "mnist_ldce/configs/mnist/ldm_mnist.yaml"
   ckpt_path: "mnist_ldce/checkpoints/mnist_ldm/mnist_ldm_best.ckpt"
 
 classifier_model:
@@ -67,7 +67,7 @@ seed: 0
 data:
   root:        "mnist_ldce/data"
   split:       "test"
-  batch_size:  8
+  batch_size:  100
   # VAE input resolution — must stay 32×32 (latent becomes 8×8 inside the model).
   image_size:  32
   num_workers: 4
@@ -78,10 +78,10 @@ data:
 # ── Input perturbation ────────────────────────────────────────────────────────
 
 perturbation:
-  enabled:   false
-  type:      gaussian
-  std:       0.1
-  magnitude: 0.1
+  enabled:   true
+  type:      uniform
+  std:       0.0
+  magnitude: [0.005, 0.01, 0.015, 0.02, 0.025]
 
 
 # ── Target class selection ────────────────────────────────────────────────────
