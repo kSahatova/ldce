@@ -9,6 +9,9 @@
 #
 # The resulting checkpoint is consumed by ldm_mnist.yaml as first_stage_config.
 
+data:
+  name:  MNIST
+
 model:
   base_learning_rate: 3e-4 #4.5e-6
   target: ldm.models.autoencoder.AutoencoderKL

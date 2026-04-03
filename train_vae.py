@@ -34,7 +34,7 @@ from ldm.util import instantiate_from_config
 # ── Dataset ───────────────────────────────────────────────────────────────────
 
 class VAEDataset(Dataset):
-    """MNIST wrapper that returns the image dict expected by AutoencoderKL.
+    """Dataset wrapper that returns the image dict expected by AutoencoderKL.
 
     Returns:
         {'image': (H, W, 3) float32 tensor in [-1, 1]}
@@ -95,9 +95,9 @@ class VAEDataModule(pl.LightningDataModule):
 
 def parse_args():
     p = argparse.ArgumentParser(description='Train a KL-VAE on MNIST')
-    p.add_argument('--cfg_path',    default='mnist_ldce/configs/autoencoderkl_mnist.yaml',
+    p.add_argument('--cfg_path',    default='assests/configs/fmnist/autoencoderkl_fmnist.yaml',
                    help='Path to the model architecture YAML')
-    p.add_argument('--output_dir',  default='./checkpoints/mnist_vae',
+    p.add_argument('--output_dir',  default='assets/checkpoints/mnist_vae',
                    help='Directory where checkpoints are saved')
     p.add_argument('--data_root',   default='./data')
     p.add_argument('--epochs',      type=int,   default=30)

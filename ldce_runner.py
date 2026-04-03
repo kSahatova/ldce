@@ -315,18 +315,21 @@ def get_target_classes(labels: torch.Tensor, logits: torch.Tensor,
 
 def generate_cf(diff_model: nn.Module, sampler: CCMDDIMSampler,
                 images: torch.Tensor, target_classes: torch.Tensor,
-                scale: float, t_enc: int, seed: int) -> torch.Tensor:
+                scale: float, t_enc: int, seed: int, inv_class_map: dict) -> torch.Tensor:
     """Encode → forward diffuse → guided denoise → decode.
-
-    Args:
-        images        : (B, C, H, W) in [0, 1] on the model's device.
-        target_classes: (B,) integer class indices.
 
     Returns:
         (B, C, H, W) counterfactual images in [0, 1].
     """
     sampler.init_images = images.clone()
     B = target_classes.shape[0]
+    if inv_class_map is not None:
+        y_clf = torch.tensor(
+            [inv_class_map[t.item()] for t in target_classes],
+            dtype=torch.long, device=diff_model.device,
+        )
+    else:
+        y_clf = target_classes.to(diff_model.device)
 
     init_latent = diff_model.get_first_stage_encoding(
         diff_model.encode_first_stage(_unmap_img(images))
@@ -351,11 +354,13 @@ def generate_cf(diff_model: nn.Module, sampler: CCMDDIMSampler,
         )
 
         torch.manual_seed(seed)
+        
+
         out = sampler.decode(
             z_enc, c, t_enc,
             unconditional_guidance_scale = scale,
             unconditional_conditioning   = uc,
-            y                            = target_classes.to(diff_model.device),
+            y                            = y_clf,
             latent_t_0                   = False,
         )
 
@@ -503,6 +508,7 @@ def main(cfg: dict, device: torch.device) -> None:
     with_pert      = pert_cfg.get("enabled", False)
     save_only_succ = cfg.get("save_only_successful", True)
 
+    # TODO : change saving strategy to the more optimal one
     prepare_output_dirs(out_dir)
     tracker = CompletedTracker(os.path.join(out_dir, "completed.txt"))
 
@@ -512,6 +518,15 @@ def main(cfg: dict, device: torch.device) -> None:
     records_pert  = load_results_pkl(pkl_path_pert)
     print(f"  results_original.pkl : {len(records_orig)} records already saved")
     print(f"  results_perturbed.pkl: {len(records_pert)} records already saved")
+
+    class_map = cfg["classifier_model"].get("class_map", None)
+    if class_map:
+        class_map = {int(k): int(v) for k, v in class_map.items()}
+        inv_class_map = {v: k for k, v in class_map.items()}
+    else:
+        # multiclass: identity mapping
+        class_map = {i: i for i in range(10)}
+        inv_class_map = class_map
 
     # ── Dataset ───────────────────────────────────────────────────────────────
     dataset = MNISTForLDCE(
@@ -565,7 +580,7 @@ def main(cfg: dict, device: torch.device) -> None:
         # ── Original counterfactuals ──────────────────────────────────────────
         cf_orig = generate_cf(
             diff_model, sampler, images, tgt_classes,
-            cfg["scale"], t_enc, seed,
+            cfg["scale"], t_enc, seed, inv_class_map
         )
 
         with torch.inference_mode():
@@ -614,12 +629,12 @@ def main(cfg: dict, device: torch.device) -> None:
                     noise_seed    = pert_cfg.get("noise_seed"),
                 )                                          # → (B, 1, C, H, W)
                 perturbed = torch.from_numpy(
-                    perturbed_np[:, 0]                     # → (B, C, H, W)
+                    perturbed_np[:, 0].astype(np.float32)  # → (B, C, H, W) float32
                 ).to(device)
 
                 cf_pert = generate_cf(
                     diff_model, sampler, perturbed, tgt_classes,
-                    cfg["scale"], t_enc, seed,
+                    cfg["scale"], t_enc, seed, inv_class_map
                 )
                 with torch.inference_mode():
                     logits_cf_pert = classifier(cf_pert)
@@ -670,9 +685,9 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    # args   = parse_args()
-    args = easydict.EasyDict({'config': 'ldce_mnist/mnist_ldce/configs/mnist/config_ldce_mnist.yaml',
-            'device': 'cpu'})
+    args   = parse_args()
+    # args = easydict.EasyDict({'config': 'ldce/mnist_ldce/configs/mnist/config_ldce_mnist.yaml',
+    #         'device': 'cuda'})
     cfg    = load_config(args.config)
     device = torch.device(
         args.device if args.device else

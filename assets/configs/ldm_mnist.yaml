@@ -73,7 +73,7 @@ model:
       target: ldm.models.autoencoder.AutoencoderKL
       params:
         embed_dim: 4
-        ckpt_path: "mnist_ldce/checkpoints/mnist_vae/mnist_vae_best-v2.ckpt"
+        ckpt_path: "/teamspace/studios/this_studio/ldce/mnist_ldce/checkpoints/mnist_vae/mnist_vae_best-v2.ckpt"
         lossconfig:
           target: torch.nn.Identity
         ddconfig:
