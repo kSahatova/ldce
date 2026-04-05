@@ -1,14 +1,14 @@
 """
-ldce_runner.py  –  cluster-ready LDCE counterfactual generation for MNIST.
+ldce_runner.py  –  cluster-ready LDCE counterfactual generation.
 
 For each sample the script generates a counterfactual explanation for:
   • the original input image
   • a noise-perturbed version of the same image  (if perturbation.enabled)
 
 Usage (from repository root):
-    python ldce_runner.py --config mnist_ldce/config.yaml
     python ldce_runner.py --config mnist_ldce/config.yaml --device cuda:1
 
+# TODO: update
 Output layout  (under output_dir/):
     original/           original input images
     cf_original/        counterfactuals of originals
@@ -40,7 +40,7 @@ from torchvision.utils import save_image
 
 from sampling_helpers import get_model, _unmap_img
 from ldm.models.diffusion.cc_ddim import CCMDDIMSampler
-from ldm.models.classifiers import CNNtorch
+import ldm.models.classifiers as _clf_module
 from utils.preprocessor import Normalizer
 from ldm.data.datasets  import MNIST, FashionMNIST, DermaMNIST
 from ldm.data.utils import DIGIT_NAMES, MNIST_CLOSEST_CLASS
@@ -157,7 +157,10 @@ def _src_stub_context():
 
 def load_classifier(args: dict, ckpt_path: str,
                     device: torch.device) -> nn.Module:
-    model = CNNtorch(args["input_channels"], args["num_classes"])
+    args = dict(args)  # don't mutate the caller's dict
+    cls_name = args.pop("model_class", "CNNtorch")
+    cls = getattr(_clf_module, cls_name)
+    model = cls(**args)
     with _src_stub_context():
         checkpoint = torch.load(ckpt_path, weights_only=False,
                                 map_location=device)
