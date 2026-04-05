@@ -29,10 +29,11 @@
 #   python ldce_mnist_ldm.py
 
 data:
-  name:  FashionMNIST
-  classes: [0, 4]
-  # classes: [0, 2, 4, 6]
-  undersample: False
+  name:  DermaMNIST
+  # classes: ['basal cell carcinoma', 'benign keratosis-like lesions', 'melanoma', 'melanocytic nevi'] 
+  classes: ['benign keratosis-like lesions', 'melanoma'] 
+  undersample: false
+
 
 model:
   target: ldm.models.diffusion.ddpm.LatentDiffusion
@@ -46,8 +47,8 @@ model:
     first_stage_key: "image"
     cond_stage_key:  "class_label"
     # Spatial size of the latent tensor the UNet sees.
-    # With AutoencoderKL f=4 (2 downsampling stages): 32 / 4 = 8
-    image_size: 8
+    # With AutoencoderKL f=4 (2 downsampling stages): 64 / 4 = 16
+    image_size: 16 #8
     channels: 4             # latent channel depth (embed_dim of the VAE)
     cond_stage_trainable: false
     conditioning_key: crossattn
@@ -59,7 +60,7 @@ model:
     unet_config:
       target: ldm.modules.diffusionmodules.openaimodel.UNetModel
       params:
-        image_size: 8
+        image_size: 16 #8
         in_channels: 4
         out_channels: 4
         model_channels: 96 #128
@@ -79,20 +80,20 @@ model:
       target: ldm.models.autoencoder.AutoencoderKL
       params:
         embed_dim: 4
-        ckpt_path: "assets/checkpoints/fmnist_vae/binary/fmnist_vae_best.ckpt"
-        # ckpt_path: "assets/checkpoints/fmnist_vae/multi/fmnist_vae_best.ckpt"
+        ckpt_path: "assets/checkpoints/derma_vae/binary/derma_vae_best.ckpt"
+        # ckpt_path: "assets/checkpoints/derma_vae/multi/derma_vae_best.ckpt"
         lossconfig:
           target: torch.nn.Identity
         ddconfig:
           double_z: True
           z_channels: 4
-          resolution: 32
+          resolution: 64            # spatial resolution of the input
           in_channels: 3
           out_ch: 3
           ch: 64
-          ch_mult: [1, 2, 2]
+          ch_mult: [1, 2, 2]        # 2 downsampling stages: 64 → 32 → 16
           num_res_blocks: 2
-          attn_resolutions: [8]
+          attn_resolutions: [16]     # self-attention at 16×16
           dropout: 0.0
 
     # Class-conditional embedding: digits 0–9 plus null/unconditional class 10.
