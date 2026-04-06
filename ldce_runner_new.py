@@ -164,6 +164,7 @@ def load_classifier(args: dict, ckpt_path: str, device: torch.device) -> nn.Modu
     cls_name = args.pop("model_class", "CNNtorch")
     cls = getattr(_clf_module, cls_name)
     lightning_used = args.pop("lightning_used", False)
+    in_channels = args.pop("input_channels", 1)
     
     model = cls(**args)
     with _src_stub_context():
@@ -548,7 +549,7 @@ def main(cfg: dict, device: torch.device) -> None:
             tgt = tgt_classes[j].item()
             label = labels[j].item()
 
-            orig_success = sm_cf_orig[j].argmax().item() == tgt
+            orig_success = sm_cf_orig[j].argmax().item() == inv_class_map[tgt]
             tracker.mark_done(uidx)
             if save_only_succ and not orig_success:
                 continue
@@ -556,8 +557,8 @@ def main(cfg: dict, device: torch.device) -> None:
             batch_orig.append(
                 {
                     "unique_id": uidx,
-                    "source": DIGIT_NAMES[label],
-                    "target": DIGIT_NAMES[tgt],
+                    # "source": DIGIT_NAMES[label],
+                    # "target": DIGIT_NAMES[tgt],
                     "image": images[j].cpu(),
                     "image_cf": cf_orig[j].cpu(),
                 }
@@ -607,7 +608,7 @@ def main(cfg: dict, device: torch.device) -> None:
                     tgt = tgt_classes[j].item()
                     label = labels[j].item()
 
-                    pert_success = sm_cf_pert[j].argmax().item() == tgt
+                    pert_success = sm_cf_pert[j].argmax().item() == inv_class_map[tgt]
                     if save_only_succ and not pert_success:
                         continue
 
@@ -615,8 +616,8 @@ def main(cfg: dict, device: torch.device) -> None:
                         {
                             "unique_id": unique_ids[j].item(),
                             "epsilon": epsilon,
-                            "source": DIGIT_NAMES[label],
-                            "target": DIGIT_NAMES[tgt],
+                            # "source": DIGIT_NAMES[label],
+                            # "target": DIGIT_NAMES[tgt],
                             "image_perturbed": perturbed[j].cpu(),
                             "image_cf_perturbed": cf_pert[j].cpu(),
                         }
@@ -653,8 +654,8 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    # args = easydict.EasyDict({'config': 'ldce/mnist_ldce/configs/mnist/config_ldce_mnist.yaml',
-    #         'device': 'cuda'})
+    # args = easydict.EasyDict({'config': '/teamspace/studios/this_studio/ldce/assets/configs/config_ldce_derma.yaml',
+    #                           'device': 'cpu'})
     cfg = load_config(args.config)
     device = torch.device(
         args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")

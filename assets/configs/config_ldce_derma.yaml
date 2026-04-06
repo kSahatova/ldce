@@ -16,36 +16,42 @@ resume: false
 record_intermediate_results: false
 evaluate_classifier: false
 save_only_successful: false
-output_dir: assets/results/fmnist/multi
-# output_dir: assets/results/fmnist/binary
+# output_dir: assets/results/derma/multi
+output_dir: assets/results/derma/binary
 
 
 # ── Model paths ───────────────────────────────────────────────────────────────
 
 diffusion_model:
-  cfg_path:  "assets/configs/ldm_mnist.yaml"
-  ckpt_path: "assets/checkpoints/fmnist_ldm/binary/ldm_best.ckpt"
+  cfg_path:  "assets/configs/ldm_derma.yaml"
+  # ckpt_path: "assets/checkpoints/derma_ldm/multi/ldm_best.ckpt"
+  ckpt_path: "assets/checkpoints/derma_ldm/binary/ldm_best.ckpt"
 
 classifier_model:
   args:
-    model_class: "SimpleCNNtorch" # a class name of the predictive model to use
-    input_channels: 1 # number of input channels
-    in_conv_channels: [1, 8, 16] 
-    out_conv_channels: [8, 16, 32]
-    conv_kernels: [7, 5, 3]
-    softmax_flag: True
-    num_classes: 4
-    # num_classes: 2
+    model_class: "build_resnet50" # a class name of the predictive model to use
+    input_channels: 3 # number of input channels
+    pretrained: False
+    freeze_backbone: False
+    unfreeze_last_n: 0
+    # num_classes: 4
+    num_classes: 2
     lightning_used: True
-  class_map: {0: 0, 1: 2, 2: 4, 3: 6}          # classifier_index → MNIST_digit
-  # class_map: {0: 0, 1: 4}          # classifier_index → MNIST_digit
-  input_size: 28
-  ckpt_path: "assets/checkpoints/fmnist_classifier/fmnist__epoch=12_val_accuracy=0.84.pth"
-  # ckpt_path: "assets/checkpoints/fmnist_classifier/fmnist_0_4_epoch=06_val_accuracy=0.99.pth"
+  # class_map: {0: 'basal cell carcinoma',
+  #             1: 'benign keratosis-like lesions',
+  #             2: 'melanoma',
+  #             3: 'melanocytic nevi'}          # classifier_index → derma_digit
+  # class_map: {0: 'benign keratosis-like lesions', 1: 'melanoma'}
+  # class_map: {0: 1,  1: 2, 2: 4, 3: 5}
+  class_map: {0: 2, 1: 4}   # binary: clf 0=benign keratosis(orig 2), clf 1=melanoma(orig 4)
+
+  input_size: 64
+  # ckpt_path: "assets/checkpoints/derma_classifier/derma_resnet50_acc=0.74.pth"
+  ckpt_path: "/teamspace/studios/this_studio/ldce/assets/checkpoints/derma_classifier/derma_binary_resnet50_acc=0.79.pth"
 
 
   # true  → classifier accepts raw [0, 1] images (no ImageNet normalisation).
-  classifier_wrapper: true
+  classifier_wrapper: false
   mnist_normalisation: false
 
 
@@ -55,14 +61,14 @@ n_samples_per_class: 1
 
 # Slightly larger noise budget than the pixel-space model to allow the
 # LDM more freedom to edit digit shape in latent space.
-strength: 0.6
+strength: 0.8
 
 # Higher CFG scale than the pixel-space config (was 1.0).
 # Latent diffusion benefits from a stronger push toward the target class.
 # The paper uses ~3–5 for ImageNet; 3.0 is a good starting point for MNIST.
 scale: 3.0
 
-ddim_steps: 200
+ddim_steps: 250
 ddim_eta: 0.0
 log_rate: 10
 seed: 0
@@ -71,23 +77,24 @@ seed: 0
 # ── Data settings ─────────────────────────────────────────────────────────────
 
 data:
-  name:  FashionMNIST
-  root:        "./data"
+  name:  DermaMNIST
+  root:        "/teamspace/studios/this_studio/ldce/data"
+  # root:        "./data"
   split:       "test"
   batch_size:  8
   # VAE input resolution — must stay 32×32 (latent becomes 8×8 inside the model).
-  image_size:  32
+  image_size:  64
   num_workers: 4
   max_samples: 100
-  filter_classes: [0, 1, 6]
-  # filter_classes: [0]
+  filter_classes: ["benign keratosis-like lesions"]
+  # filter_classes: [1, 2, 5]
   undersample: False
 
 
 # ── Input perturbation ────────────────────────────────────────────────────────
 
 perturbation:
-  enabled:   true
+  enabled:   false
   type:      uniform
   std:       0.0
   magnitude: [0.005, 0.01, 0.015, 0.02, 0.025]
@@ -96,7 +103,7 @@ perturbation:
 # ── Target class selection ────────────────────────────────────────────────────
 
 target_class_method: "fixed"
-target_class: 4
+target_class: 4 #"melanoma"
 
 
 # ── LDCE sampler hyper-parameters ────────────────────────────────────────────

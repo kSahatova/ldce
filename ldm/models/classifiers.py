@@ -96,10 +96,30 @@ class SimpleCNNtorch(nn.Module):
         return total_params
 
 
-def build_resnet50(num_classes):
+def build_resnet50(num_classes, pretrained=True, freeze_backbone=True, unfreeze_last_n=0):
     """Builds an object of the ResNet50 class with the pretrained weights"""
-    cnn = resnet50(weights="DEFAULT")
-    cnn.fc = torch.nn.Linear(cnn.fc.in_features, num_classes)
+    if not pretrained:
+        weights = None
+        freeze_backbone = False
+    else: 
+        weights = "DEFAULT"
+    cnn = resnet50(weights=weights)
+
+    if freeze_backbone:
+        for param in cnn.parameters():
+            param.requires_grad = False
+        
+        # Optionally unfreeze last N residual blocks
+        if unfreeze_last_n > 0:
+            layers = [cnn.layer1, cnn.layer2, cnn.layer3, cnn.layer4]
+            for layer in layers[-unfreeze_last_n:]:
+                for param in layer.parameters():
+                    param.requires_grad = True
+    cnn.fc = torch.nn.Sequential(torch.nn.Linear(cnn.fc.in_features, 128),
+                                 torch.nn.ReLU(True),
+                                 torch.nn.Dropout(p=0.1),
+                                 torch.nn.Linear(128, num_classes),
+)
     return cnn
 
 
